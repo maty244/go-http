@@ -6,104 +6,73 @@ import (
 	"time"
 )
 
-// ¿POR QUÉ EXISTE responseRecorder? (El truco del "papel carbón"):
-// En Go, cuando un Handler envía un código de estado (por ejemplo, writer.WriteHeader(200)),
-// el http.ResponseWriter original lo manda directo al cliente pero NO tiene ninguna variable
-// donde nosotros podamos leer después "¿qué código se envió?".
-//
-// Entonces creamos "responseRecorder": es un envoltorio alrededor del ResponseWriter original
-// que funciona como un "papel carbón": deja pasar todo hacia el cliente, pero antes anota en
-// su libreta (statusCode) qué número de estado se envió (200, 404, 500, etc.) para que el Logger lo sepa.
+// responseRecorder envuelve la respuesta para recordar su estado HTTP.
+// ResponseWriter permite escribir el estado, pero no consultarlo después.
 type responseRecorder struct {
-	// Al poner http.ResponseWriter aquí adentro sin nombre, nuestro responseRecorder
-	// hereda automáticamente todas sus capacidades y puede hacerse pasar por un ResponseWriter normal.
+	// Es composición, no herencia: los métodos no redefinidos, como Header,
+	// se promueven desde la interfaz embebida. No agrega interfaces opcionales como Flusher.
 	http.ResponseWriter
-	statusCode  int  // Aquí anotamos el código HTTP (ej. 200) para leerlo al final en el log.
-	wroteHeader bool // Nos avisa si ya se envió el código una vez, para no enviarlo repetido por error.
+	statusCode  int
+	wroteHeader bool
 }
 
-// newResponseRecorder crea nuestro "papel carbón" envolviendo al writer original.
-// Por defecto le ponemos 200 (StatusOK), porque en Go si un handler nunca llama a WriteHeader,
-// el estado automático siempre es 200.
-func newResponseRecorder(writer http.ResponseWriter) *responseRecorder {
+func newResponseRecorder(w http.ResponseWriter) *responseRecorder {
 	return &responseRecorder{
-		ResponseWriter: writer,
-		statusCode:     http.StatusOK,
+		ResponseWriter: w,
+		// Si el handler no escribe nada, net/http termina la respuesta con 200.
+		statusCode: http.StatusOK,
 	}
 }
 
-// WriteHeader intercepta el momento en que el handler dice: writer.WriteHeader(200).
-// 1. Revisa si ya se había enviado antes (wroteHeader).
-// 2. Guarda una copia del código en rr.statusCode.
-// 3. Se lo pasa al ResponseWriter verdadero para que llegue al cliente.
-func (rr *responseRecorder) WriteHeader(code int) {
-	if rr.wroteHeader {
+// WriteHeader recuerda el primer estado definitivo y lo transmite al cliente.
+func (rec *responseRecorder) WriteHeader(code int) {
+	if rec.wroteHeader {
 		return
 	}
 
-	rr.statusCode = code
-	rr.wroteHeader = true
-	rr.ResponseWriter.WriteHeader(code)
-}
-
-// Write intercepta cuando el handler escribe el contenido final (por ejemplo, el JSON).
-// Si el handler se olvidó de llamar a WriteHeader antes de escribir los datos,
-// nosotros marcamos el 200 OK primero y luego enviamos los datos al cliente.
-func (rr *responseRecorder) Write(body []byte) (int, error) {
-	if !rr.wroteHeader {
-		rr.WriteHeader(http.StatusOK)
+	// Los estados informativos, como 103 Early Hints, permiten enviar después
+	// el estado definitivo. 101 es especial: cambia el protocolo de la conexión.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		rec.ResponseWriter.WriteHeader(code)
+		return
 	}
-	return rr.ResponseWriter.Write(body)
+
+	// Delegamos primero: si net/http rechaza un código inválido, no lo registramos.
+	rec.ResponseWriter.WriteHeader(code)
+	rec.statusCode = code
+	rec.wroteHeader = true
 }
 
-// ¿QUÉ ES UN MIDDLEWARE? (El guardia de seguridad en la entrada):
-// Un Middleware es un intermediario que se para en la puerta ANTES que tus handlers.
-// Cuando llega un cliente:
-//
-//	[Cliente pide GET /health]
-//	        │
-//	        ▼
-//	1. Entra al Middleware Logger (prende un cronómetro y prepara el "papel carbón" rec)
-//	        │
-//	        ▼
-//	2. Llama a next.ServeHTTP(rec, request) -> Deja pasar el pedido al Recepcionista (mux) y al HealthHandler
-//	        │
-//	        ▼
-//	3. HealthHandler responde {"status":"ok"} con código 200 (y "rec" anota ese 200)
-//	        │
-//	        ▼
-//	4. Vuelve al Middleware Logger (detiene el cronómetro e imprime en consola qué pasó y cuánto tardó)
-//
-// ¿Por qué hay 3 funciones una dentro de otra? (No te asustes, es una receta estándar en Go):
-//   - Nivel 1: Logger(logger) -> Recibe tu herramienta de logs cuando arranca main.go.
-//   - Nivel 2: func(next http.Handler) -> Recibe a quién debe envolver/proteger (el recepcionista mux).
-//   - Nivel 3: http.HandlerFunc(...) -> Es el guardia en vivo: este código sí se ejecuta en CADA petición.
-func Logger(logger *slog.Logger) func(http.Handler) http.Handler {
-	// NIVEL 2: Esta función se ejecuta una sola vez cuando haces srv.Use(...) en main.go.
-	// "next" es el siguiente paso en la fila (en tu proyecto, es el recepcionista mux).
+// Write registra el 200 implícito cuando se escribe sin un WriteHeader previo.
+func (rec *responseRecorder) Write(body []byte) (int, error) {
+	if !rec.wroteHeader {
+		rec.statusCode = http.StatusOK
+		rec.wroteHeader = true
+	}
+	// Dejamos que el writer original envíe el 200 implícito y detecte Content-Type.
+	return rec.ResponseWriter.Write(body)
+}
+
+// RequestLogger registra método, ruta, estado y duración de cada petición completada.
+// Se coloca por fuera de Recovery para registrar también los errores recuperados.
+func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
+	// Nivel 1: recibimos el logger. Nivel 2: recibimos el handler que vamos a envolver.
 	return func(next http.Handler) http.Handler {
-		// NIVEL 3: http.HandlerFunc convierte una función común en un http.Handler oficial.
-		// Todo lo que está aquí adentro se ejecuta CADA VEZ que un usuario entra a cualquier URL.
-		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			// --- PASO A: ANTES DE ATENDER EL PEDIDO ---
-			// 1. Miramos el reloj para saber a qué hora exacta entró la petición.
+		// Nivel 3: este código se ejecuta por cada petición.
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			// 2. Envolvemos el writer original con nuestro "papel carbón" (rec) para espiar qué código responde.
-			rec := newResponseRecorder(writer)
+			rec := newResponseRecorder(w)
 
-			// --- PASO B: DEJAR PASAR EL PEDIDO ---
-			// Le pasamos el pedido al siguiente encargado (next).
-			// El programa se queda esperando en esta línea hasta que el HealthHandler termine de responderle al cliente.
-			next.ServeHTTP(rec, request)
+			// Al retornar, el handler ya terminó de escribir su respuesta.
+			next.ServeHTTP(rec, r)
 
-			// --- PASO C: DESPUÉS DE ATENDER EL PEDIDO ---
-			// Ya le respondimos al cliente. Ahora el guardia anota el resumen en la consola:
-			logger.InfoContext(request.Context(), "request completado",
-				slog.String("method", request.Method),          // Qué verbo usó (ej. "GET").
-				slog.String("path", request.URL.Path),          // A qué ruta entró (ej. "/health").
-				slog.Int("status", rec.statusCode),             // Qué código devolvió el handler (ej. 200).
-				slog.Duration("duration", time.Since(start)),   // Cuánto tiempo tardó desde "start" hasta ahora.
-				slog.String("remote_addr", request.RemoteAddr), // Desde qué dirección IP nos llamaron.
+			logger.InfoContext(r.Context(), "petición completada",
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.Int("status", rec.statusCode),
+				slog.Duration("duration", time.Since(start)),
+				// RemoteAddr incluye IP y puerto del par conectado, que podría ser un proxy.
+				slog.String("remote_addr", r.RemoteAddr),
 			)
 		})
 	}

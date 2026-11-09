@@ -1,53 +1,48 @@
 package main
 
 import (
+	"log/slog"
+	"net/http"
+	"os"
+
 	"back/internal/handler"
+	"back/internal/logger"
 	"back/internal/middlewares"
 	"back/internal/server"
-	"log"
-	"log/slog"
-	"os"
 )
 
 func main() {
+	// 1. Configurar el logger. El paquete logger construye la instancia appLogger.
+	// DefaultConfig devuelve las opciones; New construye el logger con ellas.
+	appLogger := logger.New(logger.DefaultConfig())
 
-	// 1. EL LIBRO DE REGISTROS (Logger):
-	// Crea una herramienta para imprimir mensajes en la consola en formato JSON.
-	// Nos sirve para ver en pantalla qué está pasando en el servidor.
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// 2. Preparar el servidor. New todavía no abre el puerto.
+	srv := server.New(":8080", appLogger)
 
-	// 2. CREAR EL SERVIDOR (El edificio):
-	// Preparamos el servidor para que escuche en el puerto ":8080" de tu computadora
-	// (por ejemplo, al entrar a http://localhost:8080). Todavía no está encendido.
-	srv := server.New(":8080")
+	// 3. Envolver el router. El último middleware agregado se ejecuta primero:
+	// RequestLogger -> Recovery -> router -> handler de la ruta.
+	// Así, RequestLogger también registra el 500 que escribe Recovery ante un panic.
+	srv.Use(middlewares.Recovery(appLogger))
+	srv.Use(middlewares.RequestLogger(appLogger))
 
-	// 3. AGREGAR UN MIDDLEWARE (El guardia en la entrada):
-	// Con Use() ponemos al middleware Logger en la puerta principal del servidor.
-	// Así, TODA petición que llegue pasará primero por este registrador antes
-	// de llegar a cualquier ruta.
-	srv.Use(middlewares.Logger(logger))
-
-	// 4. CREAR EL ENCARGADO DE LA RUTA (El trabajador / Handler):
-	// Creamos el encargado que sabe cómo responder cuando pregunten por la salud del servidor.
+	// 4. Registrar las rutas. Cada llamada agrega un patrón y su handler.
 	healthHandler := handler.NewHealthHandler()
+	srv.RegisterRoute("GET /health", healthHandler)
+	// Por ahora /ready responde lo mismo que /health: no comprueba dependencias.
+	srv.RegisterRoute("GET /ready", healthHandler)
 
-	// 5. REGISTRAR LAS RUTAS (El mapa para el recepcionista):
-	// Le decimos al servidor:
-	// - Si alguien pide "GET /health", mándalo con healthHandler.
-	// - Si alguien pide "GET /ready", mándalo también con healthHandler.
-	// (Desde Go 1.22 puedes escribir el método HTTP como "GET " antes de la ruta).
-	srv.RegisterRoutes("GET /health", healthHandler)
-	srv.RegisterRoutes("GET /ready", healthHandler)
+	// Ruta de estudio: permite observar el recovery y luego volver a probar /health.
+	// Debe retirarse antes de publicar una aplicación real.
+	srv.RegisterRoute("GET /panic", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("esto es una prueba de recovery")
+	}))
 
-	log.Println("Iniciando servidor en el puerto :8080")
-
-	logger.Info("Iniciando servidor en el puerto :8080", slog.String("addr", ":8080"))
-
-	// 6. ENCENDER EL SERVIDOR (Abrir las puertas):
-	// Start() deja el programa corriendo y esperando peticiones sin cerrarse.
-	// Si ocurre algún problema grave al arrancar (por ejemplo, el puerto 8080 ya está ocupado),
-	// log.Fatal muestra el error y detiene el programa.
+	// 5. Atender peticiones hasta recibir una señal de salida o un error.
+	// Start espera el apagado ordenado antes de volver. nil significa cierre correcto.
 	if err := srv.Start(); err != nil {
-		log.Fatal("error al iniciar o ejecutar el servidor: ", err)
+		// Registramos el error aquí una sola vez. El código 1 indica fallo al sistema.
+		// os.Exit no ejecuta defer pendientes; los de Start ya se ejecutaron al retornar.
+		appLogger.Error("el servidor terminó con un error", slog.Any("error", err))
+		os.Exit(1)
 	}
 }
